@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """ЄДРСР: вибірка судових рішень з відкритих даних (data.gov.ua; резерв — сайт ДСА court.gov.ua), тексти, пошук за текстом, реєстр Excel і зведений PDF.
 
-Автор: В'ячеслав Плескач. Версія 3.1 (20.11.2026): резервне джерело архівів — сайт ДСА court.gov.ua/opendata.
+Автор: В'ячеслав Плескач. Версія 3.2 (25.11.2026): у номері справи відкидається лише літерний суфікс (-к, -ц, -а…), а не все
+після останнього дефіса («10/б-711» більше не збігається з «10/б-743»); дати --from/--to — РРРР-ММ-ДД або ДД.ММ.РРРР,
+інший формат — помилка (раніше мовчки 0 документів); grep завжди перезаписує <out>.docs.tsv; попередження, якщо той
+самий запис ПІБ судді знайдено в кількох судах; назва суду шукається в довіднику найновішого року.
+3.1 (20.11.2026): резервне джерело архівів — сайт ДСА court.gov.ua/opendata.
 
 Команди:
   check   — перевірити, чи доступні з цього середовища портал data.gov.ua, сайт ДСА і сервер текстів od.reyestr.court.gov.ua
@@ -38,7 +42,7 @@
 import argparse, csv, json, os, re, shutil, subprocess, sys, time, urllib.request, urllib.parse, ssl, zipfile, glob
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = '3.1'
+VERSION = '3.2'
 AUTHOR = "В'ячеслав Плескач"
 # Ідентифікатори наборів «Єдиний державний реєстр судових рішень за РРРР рік» на data.gov.ua (перевірено 05.11.2026).
 PORTAL = {2006: 'a0c5d4c8-ae68-48b0-87c2-e4548b7774d4', 2007: 'dedce089-cf4b-4adf-97dc-1c5152080d05', 2008: '5d93b552-2049-43c2-b9a4-32e54653c7e6',
@@ -80,7 +84,24 @@ def this_year():
 
 def parse_years(s):
     y1, _, y2 = s.partition('-')
-    return list(range(int(y1), int(y2 or y1) + 1))
+    try:
+        ys = list(range(int(y1), int(y2 or y1) + 1))
+    except ValueError:
+        ys = []
+    if not ys:
+        sys.exit(f'--years «{s}»: потрібно рік або проміжок за зростанням, напр. 2025 або 2023-2026.')
+    return ys
+
+
+def iso_date(s, name):
+    """РРРР-ММ-ДД або ДД.ММ.РРРР → РРРР-ММ-ДД (дати в архіві порівнюються як рядки)."""
+    import datetime as dt
+    for f in ('%Y-%m-%d', '%d.%m.%Y'):
+        try:
+            return dt.datetime.strptime(s.strip(), f).date().isoformat()
+        except ValueError:
+            pass
+    sys.exit(f'{name}: не розпізнано дату «{s}» (потрібно РРРР-ММ-ДД або ДД.ММ.РРРР).')
 
 
 def ssl_ctx():
@@ -333,12 +354,14 @@ def judge_match(query, value):
 
 
 # ---------------------------------------------------------------- справи
+# Ключ справи: без пробілів і регістру, без кінцевого ЛІТЕРНОГО суфікса («757/28368/24-к» → «757/28368/24»).
+# Цифровий хвіст — частина номера («10/б-711», «2-98-09»); до 3.2 він відкидався, і до вибірки потрапляли чужі справи.
 def case_key_sql(col):
-    return f"regexp_replace(lower(replace(coalesce({col},''),' ','')), '-[^/]*$', '')"
+    return f"regexp_replace(lower(replace(coalesce({col},''),' ','')), '-[^/0-9-]{{1,4}}$', '')"
 
 
 def case_key(s):
-    return re.sub(r'-[^/]*$', '', (s or '').replace(' ', '').lower())
+    return re.sub(r'-[^/0-9-]{1,4}$', '', re.sub(r'\s+', '', s or '').lower())
 
 
 # ---------------------------------------------------------------- courts
@@ -377,11 +400,13 @@ def cmd_courts(a):
         ' Ліквідованих судів у довіднику поточного року може не бути — задайте --year того року, коли суд діяв.')
 
 
-def resolve_court_names(con, names):
+def resolve_court_names(con, names, soft=False):
     codes = []
     for nm in names.split(';'):
         parts = [p.lower().replace("'", "''") for p in nm.split()]
         rows = con.execute('SELECT court_code, name FROM courts WHERE ' + ' AND '.join(f"lower(name) LIKE '%{p}%'" for p in parts)).fetchall()
+        if not rows and soft:
+            return None
         if not rows:
             sys.exit(f'Суд «{nm}» не знайдено в довіднику. Спробуйте: edrsr.py courts --name "<частина назви>"')
         if len(rows) > 1:
@@ -425,16 +450,23 @@ def write_sources(out, used):
 def cmd_meta(a):
     duckdb = need('duckdb')
     years = parse_years(a.years)
+    a.date_from = iso_date(a.date_from, '--from') if a.date_from else None
+    a.date_to = iso_date(a.date_to, '--to') if a.date_to else None
     con = duckdb.connect()
-    parts, used, judge_hits = [], [], {}
-    court_codes = [c.strip().zfill(4) for c in a.court.split(',')] if a.court else []
+    parts, used = [], []
+    court_codes = [c.strip().zfill(4) for c in a.court.split(',') if c.strip()] if a.court else []
+    if a.court_name:                              # довідник найновішого року (актуальні назви); ліквідований суд — у найстарішому
+        for yy in dict.fromkeys([years[-1], years[0]]):
+            load_dicts(con, year_dir(yy, a.local)[0])
+            codes = resolve_court_names(con, a.court_name, soft=(yy != years[0]))
+            if codes is not None:
+                court_codes += codes
+                break
     for y in years:
         d, src = year_dir(y, a.local)
         used.append((y, src))
         if y == years[-1] or not parts:
             load_dicts(con, d)                    # довідники найновішого року (назви судів актуальніші)
-        if a.court_name and y == years[0]:
-            court_codes += resolve_court_names(con, a.court_name)
         P = f"read_parquet('{d}/documents.parquet')"
         w = []
         if court_codes: w.append('court_code IN (' + ','.join(f"'{c}'" for c in court_codes) + ')')
@@ -459,8 +491,6 @@ def cmd_meta(a):
             base = ' AND '.join(w) or 'true'
             vals = [r[0] for r in con.execute(f'SELECT DISTINCT judge FROM {P} WHERE {base}').fetchall()]
             hit = [v for v in vals if any(judge_match(q, v) for q in a.judge.split(';'))]
-            for v in hit:
-                judge_hits[v] = judge_hits.get(v, 0)
             if not hit:
                 w.append('false')
             else:
@@ -481,8 +511,17 @@ def cmd_meta(a):
         log('Записи ПІБ судді, що збіглися (перевірте, чи це одна особа):')
         for v, n in sorted(cnt.items(), key=lambda x: -x[1]):
             log(f'  {n:>6}  {v}')
-        if len({tuple(sorted(jparse(v)[1])) for v in cnt if jparse(v)[1]}) > 2:
+        if len({tuple(sorted(jparse(v)[1])) for v in cnt if jparse(v)[1]}) > 1:
             log('  УВАГА: кілька різних повних ПІБ — можливі тезки; звузьте --court/--court-name або вкажіть повне ПІБ.')
+        by = {}
+        for r in rows:
+            by.setdefault(r[4], {}).setdefault(r[6] or r[5], 0)
+            by[r[4]][r[6] or r[5]] += 1
+        for v, cs in by.items():
+            if len(cs) > 1:                       # у даних переважно ініціали: тезок видно лише за судом
+                log(f'  УВАГА: запис «{v}» є в {len(cs)} судах — це можуть бути різні судді (або відрядження): '
+                    + '; '.join(f'{c} — {n}' for c, n in sorted(cs.items(), key=lambda x: -x[1])[:6])
+                    + '. Звузьте --court / --court-name.')
     write_sources(a.out, used)
     return a.out
 
@@ -495,6 +534,8 @@ def cmd_doc(a):
         sys.exit('Не знайдено doc_id (очікується число або посилання …/Review/<id>)')
     years = parse_years(a.years) if a.years else list(range(this_year(), 2005, -1))
     years = sorted(years, reverse=True)
+    if not a.years:
+        log('Без --years архіви перебираються від поточного року назад (кожен — сотні МБ); якщо рік надходження відомий, задайте --years.')
     con = duckdb.connect()
     found, used, left = [], [], set(ids)
     for y in years:
@@ -567,6 +608,8 @@ def cmd_texts(a):
                 log(f'  {n}/{len(todo)} за {time.time() - t:.0f} с, помилок {len(fails)}')
     dt = time.time() - t
     log(f'Готово: {n} за {dt:.0f} с ({n / max(dt, 1):.1f} док/с), помилок {len(fails)}')
+    if not fails and os.path.exists(os.path.join(a.dir, '_fails.tsv')):
+        os.remove(os.path.join(a.dir, '_fails.tsv'))       # перелік помилок попереднього запуску більше не чинний
     if fails:
         with open(os.path.join(a.dir, '_fails.tsv'), 'w', encoding='utf-8') as f:
             for i, e in fails: f.write(f'{i}\t{e}\n')
@@ -599,11 +642,11 @@ def cmd_grep(a):
             out.append([r['doc_id'], r.get('cause_num', ''), r.get('adjudication_date', ''), r.get('judgment_form', ''),
                         m.group(0), t[max(0, m.start() - a.context):m.end() + a.context], r.get('web_url', '')])
     write_tsv(a.out, ['doc_id', 'cause_num', 'adjudication_date', 'judgment_form', 'match', 'fragment', 'web_url'], out)
-    if keep:
-        cols = list(keep[0].keys())
-        write_tsv(a.out + '.docs.tsv', cols, [[k.get(c, '') for c in cols] for k in keep])
-        if os.path.exists(a.inp + '.dzherela.txt'):
-            shutil.copy(a.inp + '.dzherela.txt', a.out + '.docs.tsv.dzherela.txt')
+    # завжди перезаписуємо: інакше після пошуку без збігів лишався б файл попереднього пошуку
+    cols = list(keep[0].keys()) if keep else (list(rows[0].keys()) if rows else ['doc_id']) + ([] if a.invert else ['hits', 'snippet'])
+    write_tsv(a.out + '.docs.tsv', cols, [[k.get(c, '') for c in cols] for k in keep])
+    if os.path.exists(a.inp + '.dzherela.txt'):
+        shutil.copy(a.inp + '.dzherela.txt', a.out + '.docs.tsv.dzherela.txt')
     log(f'Документів зі збігом{" (інвертовано: без збігу)" if a.invert else ""}: {len(keep)} з {len(rows)}; '
         f'фрагментів: {len(out)} → {a.out}; документи → {a.out}.docs.tsv' + (f'; без тексту: {no_text}' if no_text else ''))
 
@@ -686,7 +729,9 @@ def pdf_report(rows, dirpath, path):
     w.add_metadata({'/Author': AUTHOR, '/Title': 'Тексти судових рішень (ЄДРСР)'})
     with open(path, 'wb') as f:
         w.write(f)
-    log(f'PDF: {n} документів, {len(w.pages)} сторінок → {path}' + (f'; без тексту: {len(missing)}' if missing else ''))
+    lost = len(rows) - n - len(missing)
+    log(f'PDF: {n} документів, {len(w.pages)} сторінок → {path}' + (f'; без тексту: {len(missing)}' if missing else '')
+        + (f'; НЕ перетворено в PDF (LibreOffice): {lost}' if lost else ''))
 
 
 def cmd_report(a):
