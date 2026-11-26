@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """ЄДРСР: вибірка судових рішень з відкритих даних (data.gov.ua; резерв — сайт ДСА court.gov.ua), тексти, пошук за текстом, реєстр Excel і зведений PDF.
 
-Автор: В'ячеслав Плескач. Версія 3.3 (26.11.2026): суд знаходиться і за назвою до перейменування за Законом № 4273-IX
+Автор: В'ячеслав Плескач. Версія 3.4 (26.11.2026): значення фільтрів у SQL екрануються — апостроф у --judge-like
+(«Дем'ян»), --case, --kind, --form, --cat, --instance, --code, --prefix більше не дає помилки SQL; річні архіви
+об'єднуються за назвами колонок (UNION ALL BY NAME), а не за їх порядком — інший порядок чи склад колонок у старих
+архівах не зсуне значення між полями.
+3.3 (26.11.2026): суд знаходиться і за назвою до перейменування за Законом № 4273-IX
 («Малиновський районний суд міста Одеси» → «Хаджибейський…»: у довідниках усіх річних архівів лишилися тільки нинішні
 назви); у назві суду «м.» і «міста» та різні апострофи рівнозначні (--court-name і courts --name).
 3.2 (25.11.2026): у номері справи відкидається лише літерний суфікс (-к, -ц, -а…), а не все
@@ -45,7 +49,7 @@
 import argparse, csv, json, os, re, shutil, subprocess, sys, time, urllib.request, urllib.parse, ssl, zipfile, glob
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = '3.3'
+VERSION = '3.4'
 AUTHOR = "В'ячеслав Плескач"
 # Ідентифікатори наборів «Єдиний державний реєстр судових рішень за РРРР рік» на data.gov.ua (перевірено 05.11.2026).
 PORTAL = {2006: 'a0c5d4c8-ae68-48b0-87c2-e4548b7774d4', 2007: 'dedce089-cf4b-4adf-97dc-1c5152080d05', 2008: '5d93b552-2049-43c2-b9a4-32e54653c7e6',
@@ -67,6 +71,11 @@ PORTAL_DOWN = None       # причина, якщо портал уже не в�
 TEXT_HOST = 'https://od.reyestr.court.gov.ua/'
 CACHE = os.environ.get('EDRSR_CACHE', os.path.expanduser('~/.cache/edrsr'))
 DICTS = ('courts.csv', 'judgment_forms.csv', 'justice_kinds.csv', 'cause_categories.csv', 'regions.csv', 'instances.csv')
+
+
+def sq(v):
+    """Рядковий літерал SQL з екрануванням апострофа (3.4)."""
+    return "'" + str(v).replace("'", "''") + "'"
 
 
 def log(*a):
@@ -386,11 +395,11 @@ def cmd_courts(a):
     w, notes = [], []
     if a.name:
         found, notes = find_courts(con, a.name)
-        w.append('c.court_code IN (' + (','.join(f"'{c}'" for c, _ in found) or "''") + ')')
+        w.append('c.court_code IN (' + (','.join(sq(c) for c, _ in found) or "''") + ')')
     if a.code:
-        w.append('c.court_code IN (' + ','.join(f"'{x.strip().zfill(4)}'" for x in a.code.split(',')) + ')')
+        w.append('c.court_code IN (' + ','.join(sq(x.strip().zfill(4)) for x in a.code.split(',')) + ')')
     if a.prefix:
-        w.append(f"p.pre = '{a.prefix.split('/')[0]}' AND CAST(p.share AS DOUBLE) >= 60")
+        w.append(f"p.pre = {sq(a.prefix.split('/')[0])} AND CAST(p.share AS DOUBLE) >= 60")
     rows = con.execute(f"""SELECT c.court_code, c.name, i.name, r.name, coalesce(p.pre,''), coalesce(p.share,'')
                            FROM courts c LEFT JOIN inst i ON i.instance_code=c.instance_code
                            LEFT JOIN regions r ON r.region_code=c.region_code LEFT JOIN pref p ON p.court_code=c.court_code
@@ -618,24 +627,24 @@ def cmd_meta(a):
             load_dicts(con, d)                    # довідники найновішого року (назви судів актуальніші)
         P = f"read_parquet('{d}/documents.parquet')"
         w = []
-        if court_codes: w.append('court_code IN (' + ','.join(f"'{c}'" for c in court_codes) + ')')
-        if a.kind: w.append('justice_kind IN (' + ','.join(f"'{k}'" for k in a.kind.split(',')) + ')')
-        if a.form: w.append('judgment_code IN (' + ','.join(f"'{k}'" for k in a.form.split(',')) + ')')
-        if a.cat: w.append('category_code IN (' + ','.join(f"'{k}'" for k in a.cat.split(',')) + ')')
+        if court_codes: w.append('court_code IN (' + ','.join(sq(c) for c in court_codes) + ')')
+        if a.kind: w.append('justice_kind IN (' + ','.join(sq(k.strip()) for k in a.kind.split(',')) + ')')
+        if a.form: w.append('judgment_code IN (' + ','.join(sq(k.strip()) for k in a.form.split(',')) + ')')
+        if a.cat: w.append('category_code IN (' + ','.join(sq(k.strip()) for k in a.cat.split(',')) + ')')
         if a.case:
             cs = [c.strip() for c in a.case.split(',') if c.strip()]
             like = [c for c in cs if '%' in c or '_' in c]
             exact = [case_key(c) for c in cs if c not in like]
-            cw = [f"cause_num LIKE '{c}'" for c in like]
-            if exact: cw.append(f"{case_key_sql('cause_num')} IN (" + ','.join(f"'{c}'" for c in exact) + ')')
+            cw = [f"cause_num LIKE {sq(c)}" for c in like]
+            if exact: cw.append(f"{case_key_sql('cause_num')} IN (" + ','.join(sq(c) for c in exact) + ')')
             w.append('(' + ' OR '.join(cw) + ')')
         if a.date_from: w.append(f"substr(adjudication_date,1,10) >= '{a.date_from}'")
         if a.date_to: w.append(f"substr(adjudication_date,1,10) <= '{a.date_to}'")
         if a.instance:
             w.append(f"court_code IN (SELECT court_code FROM {rd(d, 'courts.csv')} WHERE instance_code IN ("
-                     + ','.join(f"'{i}'" for i in a.instance.split(',')) + '))')
+                     + ','.join(sq(i.strip()) for i in a.instance.split(',')) + '))')
         if not a.include_removed: w.append("status <> '0'")
-        if a.judge_like: w.append(f"judge ILIKE '%{a.judge_like}%'")
+        if a.judge_like: w.append(f"judge ILIKE {sq('%' + a.judge_like + '%')}")
         if a.judge:
             base = ' AND '.join(w) or 'true'
             vals = [r[0] for r in con.execute(f'SELECT DISTINCT judge FROM {P} WHERE {base}').fetchall()]
@@ -645,7 +654,7 @@ def cmd_meta(a):
             else:
                 w.append('judge IN (' + ','.join("'" + v.replace("'", "''") + "'" for v in hit) + ')')
         parts.append(f"SELECT *, '{y}' AS archive_year FROM {P}" + (' WHERE ' + ' AND '.join(w) if w else ''))
-    q = f"""WITH d AS ({' UNION ALL '.join(parts)}) SELECT {SELECT_OUT} FROM d {JOINS}
+    q = f"""WITH d AS ({' UNION ALL BY NAME '.join(parts)}) SELECT {SELECT_OUT} FROM d {JOINS}
             QUALIFY row_number() OVER (PARTITION BY d.doc_id ORDER BY d.archive_year DESC) = 1
             ORDER BY adjudication_date, d.doc_id"""
     t = time.time()
@@ -694,7 +703,7 @@ def cmd_doc(a):
         used.append((y, src))
         load_dicts(con, d)
         P = f"read_parquet('{d}/documents.parquet')"
-        lst = ','.join(f"'{i}'" for i in left)
+        lst = ','.join(sq(i) for i in left)
         rows = con.execute(f"SELECT {SELECT_OUT} FROM (SELECT *, '{y}' AS archive_year FROM {P} WHERE doc_id IN ({lst})) d {JOINS}").fetchall()
         cols = [c[0] for c in con.description]
         found += rows
