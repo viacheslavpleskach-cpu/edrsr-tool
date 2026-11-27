@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """ЄДРСР: вибірка судових рішень з відкритих даних (сайт ДСА court.gov.ua; резерв — data.gov.ua), тексти, пошук за текстом, реєстр Excel і зведений PDF.
 
-Автор: В'ячеслав Плескач. Версія 3.5.1 (27.11.2026): команда check перевіряє спершу сайт ДСА (основне джерело архівів), потім
+Автор: В'ячеслав Плескач. Версія 3.6 (27.11.2026): у режимі --dzherelo auto архів кожного року береться зі свіжішого з двох
+джерел — сайту ДСА або data.gov.ua (портал — лише якщо його архів новіший за архів ДСА більш ніж на 12 год, бо зазвичай
+він віддзеркалює ДСА з запізненням; одна додаткова перевірка метаданих порталу на рік). Версія 3.5.1 (27.11.2026): команда check перевіряє спершу сайт ДСА (основне джерело архівів), потім
 data.gov.ua (резерв) і за недоступності ДСА попереджає, що архіви порталу можуть бути застарілими. Версія 3.5 (27.11.2026): основне джерело архівів — сайт ДСА, data.gov.ua — резерв (портал після
 збою 19.11.2026 відповідає, але віддає edrsr_data_2026.zip від 15.11.2026, а ДСА оновлює архів щодня). Версія 3.4 (26.11.2026): значення фільтрів у SQL екрануються — апостроф у --judge-like
 («Дем'ян»), --case, --kind, --form, --cat, --instance, --code, --prefix більше не дає помилки SQL; річні архіви
@@ -43,16 +45,18 @@ data.gov.ua (резерв) і за недоступності ДСА попер�
     роки від відкриття провадження до поточного (рішення кінця грудня потрапляють у наступний рік).
   * Код суду ЄДРСР (court_code, 4 знаки, напр. 2606) ≠ префікс номера справи (3 знаки, напр. 757). Команда courts показує обидва.
   * Джерело й дату даних за кожен рік скрипт пише у <out>.dzherela.txt.
-  * Джерело архівів: типово сайт ДСА (оновлюється щодня), а якщо він не відповідає — data.gov.ua (ті самі набори
-    того самого розпорядника; після збою 19.11.2026 портал може віддавати застарілі архіви). --dzherelo dsa — одразу ДСА; --dzherelo portal — лише портал. Архіви edrsr_data_РРРР.zip
+  * Джерело архівів: типово (--dzherelo auto) — свіжіший із двох: сайт ДСА (основне, оновлюється щодня) або data.gov.ua
+    (ті самі набори того самого розпорядника), якщо архів порталу новіший за архів ДСА більш ніж на 12 год чи ДСА не
+    відповідає; після збою 19.11.2026 портал може віддавати застарілі архіви. --dzherelo dsa — лише ДСА; --dzherelo portal — лише портал. Архіви edrsr_data_РРРР.zip
     можна також покласти в теку і передати --local <тека>.
 Залежності (ставляться самі): duckdb, striprtf, openpyxl, pypdf; для PDF — LibreOffice (soffice).
 """
 import argparse, csv, json, os, re, shutil, subprocess, sys, time, urllib.request, urllib.parse, ssl, zipfile, glob
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = '3.5.1'
+VERSION = '3.6'
 AUTHOR = "В'ячеслав Плескач"
+SVIZHIST_H = 12  # на скільки годин архів data.gov.ua має бути новішим за архів ДСА, щоб брати його (режим auto)
 # Ідентифікатори наборів «Єдиний державний реєстр судових рішень за РРРР рік» на data.gov.ua (перевірено 05.11.2026).
 PORTAL = {2006: 'a0c5d4c8-ae68-48b0-87c2-e4548b7774d4', 2007: 'dedce089-cf4b-4adf-97dc-1c5152080d05', 2008: '5d93b552-2049-43c2-b9a4-32e54653c7e6',
           2009: 'dc344166-85f7-4278-bae3-e33331c58029', 2010: '2fd047e6-35ff-4bf1-88f7-99b5261a9e7f', 2011: '7e9ea7cc-fec1-45d7-8ebe-c0f3d3e406a6',
@@ -174,9 +178,10 @@ def cmd_check(a):
 
 
 # ---------------------------------------------------------------- архіви
-def portal_pkg(year):
+def portal_pkg(year, quick=False):
+    """quick — одна спроба без 15 с очікування (коли портал лише звіряється з ДСА)."""
     def get(u):
-        for att in range(2):
+        for att in range(1 if quick else 2):
             try:
                 return json.loads(http_get(u, 60))['result']
             except Exception:
@@ -209,8 +214,25 @@ def dsa_page_no(year):
     return max(hits)
 
 
+def utc_ts(s):
+    """Час версії → секунди UTC: HTTP-дата (Last-Modified ДСА) або ISO без зони (data.gov.ua, UTC); None, якщо не розібрано."""
+    import email.utils, datetime as _dt
+    if not s:
+        return None
+    try:
+        if s[:4].isdigit():
+            return _dt.datetime.fromisoformat(s[:19]).replace(tzinfo=_dt.timezone.utc).timestamp()
+        return email.utils.parsedate_to_datetime(s).timestamp()
+    except Exception:
+        return None
+
+
+def kyiv(ts):
+    return time.strftime('%d.%m.%Y %H:%M', time.localtime(ts)) if ts else '?'
+
+
 def dsa_resource(year):
-    """→ (URL архіву, позначка версії, дата оновлення ДД.ММ.РРРР) з паспорта набору ДСА і заголовків файлу."""
+    """→ (URL архіву, позначка версії, дата оновлення ДД.ММ.РРРР, номер набору, час версії UTC) з паспорта набору ДСА і заголовків файлу."""
     n = dsa_page_no(year)
     pas = json.loads(http_get(f'{DSA_HOST}/open_data_json.php?json={n}', 60))
     files = {k: v for f in pas.get('Файли', []) for k, v in f.items()}
@@ -228,7 +250,7 @@ def dsa_resource(year):
         day = time.strftime('%d.%m.%Y', time.localtime(email.utils.parsedate_to_datetime(lm).timestamp()))
     except Exception:
         day = '?'
-    return url, f'dsa:{n}:{lm}:{h.get("ETag", "")}:{size}', day, n
+    return url, f'dsa:{n}:{lm}:{h.get("ETag", "")}:{size}', day, n, utc_ts(lm)
 
 
 def download(url, z, year, where):
@@ -276,36 +298,29 @@ def year_dir(year, local=None):
                 build_year(z, d, stamp, year)
             return d, label
     global PORTAL_DOWN
-    errs = []
+    errs, cands = [], []
     z = os.path.join(CACHE, f'edrsr_data_{year}.zip')
-    # 3.5: основне джерело — сайт ДСА (data.gov.ua після збою 19.11.2026 віддає архів від 15.11.2026), портал — резерв
+    # 3.6: у режимі auto — свіжіший із двох джерел. Основне — сайт ДСА; архів data.gov.ua береться, лише якщо він
+    # новіший за архів ДСА більш ніж на SVIZHIST_H годин (портал зазвичай віддзеркалює ДСА з запізненням, тож
+    # дрібна різниця в часі — та сама версія) або якщо ДСА не відповідає.
     if SOURCE != 'portal':
         try:
-            url, stamp, day, n = dsa_resource(year)
-            label = f'сайт ДСА (court.gov.ua/opendata, набір {n}), архів оновлено {day}'
-            if cached == stamp:
-                return d, label
-            download(url, z, year, f'сайту ДСА (набір {n}, архів від {day})')
-            build_year(z, d, stamp, year)
-            os.remove(z)
-            return d, label
+            url, stamp, day, n, ts = dsa_resource(year)
+            cands.append({'dz': 'dsa', 'url': url, 'stamp': stamp, 'ts': ts,
+                          'label': f'сайт ДСА (court.gov.ua/opendata, набір {n}), архів оновлено {day}',
+                          'where': f'сайту ДСА (набір {n}, архів від {day})'})
         except Exception as e:
             errs.append(f'сайт ДСА: {str(e)[:100]}')
     if SOURCE != 'dsa' and not PORTAL_DOWN:
-        if errs:
-            log(f'[{year}] сайт ДСА недоступний ({errs[-1]}) — беру архів із data.gov.ua (може бути застарілим)')
         try:
-            meta = portal_pkg(year)
+            meta = portal_pkg(year, quick=bool(cands))
             zips = [r for r in meta['resources'] if r['name'].endswith('.zip')]
-            url = ([r['url'] for r in zips if r['name'] == f'edrsr_data_{year}.zip'] or [r['url'] for r in zips])[0]
+            r0 = ([r for r in zips if r['name'] == f'edrsr_data_{year}.zip'] or zips)[0]
             stamp = meta['metadata_modified']
-            label = f'data.gov.ua, набір оновлено {stamp[:10]}'
-            if cached == stamp:
-                return d, label
-            download(url, z, year, f'data.gov.ua (набір оновлено {stamp[:16]})')
-            build_year(z, d, stamp, year)
-            os.remove(z)
-            return d, label
+            cands.append({'dz': 'portal', 'url': r0['url'], 'stamp': stamp,
+                          'ts': utc_ts(r0.get('last_modified') or stamp),
+                          'label': f'data.gov.ua, набір оновлено {stamp[:10]}',
+                          'where': f'data.gov.ua (набір оновлено {stamp[:16]})'})
         except LookupError as e:
             errs.append(str(e))
         except Exception as e:
@@ -314,6 +329,23 @@ def year_dir(year, local=None):
                 PORTAL_DOWN = str(e)[:100]
     elif PORTAL_DOWN:
         errs.append(f'data.gov.ua: {PORTAL_DOWN}')
+    if len(cands) == 2:
+        dsa_c, por_c = cands
+        if dsa_c['ts'] and por_c['ts'] and por_c['ts'] - dsa_c['ts'] > SVIZHIST_H * 3600:
+            log(f'[{year}] архів data.gov.ua новіший за архів сайту ДСА ({kyiv(por_c["ts"])} проти {kyiv(dsa_c["ts"])}) — беру з порталу')
+            cands = [por_c, dsa_c]
+    elif cands and cands[0]['dz'] == 'portal' and SOURCE == 'auto':
+        log(f'[{year}] сайт ДСА недоступний ({errs[-1] if errs else "?"}) — беру архів із data.gov.ua (може бути застарілим)')
+    for c in cands:
+        try:
+            if cached == c['stamp']:
+                return d, c['label']
+            download(c['url'], z, year, c['where'])
+            build_year(z, d, c['stamp'], year)
+            os.remove(z)
+            return d, c['label']
+        except Exception as e:
+            errs.append(f'{"сайт ДСА" if c["dz"] == "dsa" else "data.gov.ua"} (завантаження): {str(e)[:100]}')
     if errs and all(e.startswith('На ') for e in errs):
         sys.exit('; '.join(errs))
     why = '; '.join(errs) or 'джерело вимкнено параметром --dzherelo'
@@ -935,7 +967,7 @@ def main():
     def common_src(p):
         p.add_argument('--local', help='тека з архівами edrsr_data_РРРР.zip (якщо портал і сайт ДСА недоступні)')
         p.add_argument('--dzherelo', choices=['auto', 'portal', 'dsa'], default='auto',
-                       help='джерело архівів: auto — сайт ДСА, а за недоступності data.gov.ua (типово); portal; dsa')
+                       help='джерело архівів: auto — свіжіший із двох (сайт ДСА; data.gov.ua — якщо новіший на 12+ год або ДСА недоступний; типово); portal; dsa')
         p.add_argument('--cache', help='тека кешу архівів (типово ~/.cache/edrsr)')
         p.add_argument('--source', help=argparse.SUPPRESS)  # сумісність із edrsr_vybirka.py 2.x; ігнорується
 
