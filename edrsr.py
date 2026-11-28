@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """ЄДРСР: вибірка судових рішень з відкритих даних (сайт ДСА court.gov.ua; резерв — data.gov.ua), тексти, пошук за текстом, реєстр Excel і зведений PDF.
 
-Автор: В'ячеслав Плескач. Версія 3.6 (27.11.2026): у режимі --dzherelo auto архів кожного року береться зі свіжішого з двох
+Автор: В'ячеслав Плескач. Версія 3.7 (28.11.2026): чесний User-Agent «edrsr.py/<версія> (+github)» замість імітації
+браузера; сертифікати — лише зі стандартних SSL_CERT_FILE / REQUESTS_CA_BUNDLE (службові файли середовища напряму не
+читаються); повідомлення про домен, заблокований проксі, — «не обходити, повідомити користувачу». Версія 3.6 (27.11.2026): у режимі --dzherelo auto архів кожного року береться зі свіжішого з двох
 джерел — сайту ДСА або data.gov.ua (портал — лише якщо його архів новіший за архів ДСА більш ніж на 12 год, бо зазвичай
 він віддзеркалює ДСА з запізненням; одна додаткова перевірка метаданих порталу на рік). Версія 3.5.1 (27.11.2026): команда check перевіряє спершу сайт ДСА (основне джерело архівів), потім
 data.gov.ua (резерв) і за недоступності ДСА попереджає, що архіви порталу можуть бути застарілими. Версія 3.5 (27.11.2026): основне джерело архівів — сайт ДСА, data.gov.ua — резерв (портал після
@@ -54,8 +56,9 @@ data.gov.ua (резерв) і за недоступності ДСА попер�
 import argparse, csv, json, os, re, shutil, subprocess, sys, time, urllib.request, urllib.parse, ssl, zipfile, glob
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = '3.6'
+VERSION = '3.7'
 AUTHOR = "В'ячеслав Плескач"
+UA = f'edrsr.py/{VERSION} (+https://github.com/viacheslavpleskach-cpu/edrsr-tool)'  # чесний User-Agent, без імітації браузера
 SVIZHIST_H = 12  # на скільки годин архів data.gov.ua має бути новішим за архів ДСА, щоб брати його (режим auto)
 # Ідентифікатори наборів «Єдиний державний реєстр судових рішень за РРРР рік» на data.gov.ua (перевірено 05.11.2026).
 PORTAL = {2006: 'a0c5d4c8-ae68-48b0-87c2-e4548b7774d4', 2007: 'dedce089-cf4b-4adf-97dc-1c5152080d05', 2008: '5d93b552-2049-43c2-b9a4-32e54653c7e6',
@@ -123,14 +126,15 @@ def iso_date(s, name):
 
 
 def ssl_ctx():
-    for p in (os.environ.get('SSL_CERT_FILE'), os.environ.get('REQUESTS_CA_BUNDLE'), os.path.expanduser('~/.ccr/ca-bundle.crt'), '/root/.ccr/ca-bundle.crt'):
+    # Лише стандартні змінні середовища; службові файли середовища виконання не читаємо напряму.
+    for p in (os.environ.get('SSL_CERT_FILE'), os.environ.get('REQUESTS_CA_BUNDLE')):
         if p and os.path.exists(p):
             return ssl.create_default_context(cafile=p)
     return None
 
 
 def http_get(url, timeout=60):
-    return urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 edrsr.py'}), timeout=timeout, context=ssl_ctx()).read()
+    return urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': UA}), timeout=timeout, context=ssl_ctx()).read()
 
 
 # ---------------------------------------------------------------- check
@@ -141,7 +145,7 @@ def probe(url, timeout=25):
         return True, f'{time.time() - t:.1f} с'
     except urllib.error.HTTPError as e:
         if e.code in (403, 405, 407) and 'proxy' in str(e.headers).lower():
-            return False, f'HTTP {e.code} від проксі середовища — домен не дозволено'
+            return False, f'HTTP {e.code} від проксі середовища — домен не дозволено; не обходити, повідомити користувачу'
         # 403/429 від самого сайту (напр. захист Cloudflare під час збою data.gov.ua) — теж недоступність
         return (e.code in (400, 404)), f'HTTP {e.code}' + (' — сайт відмовляє в доступі' if e.code in (401, 403, 429) else '')
     except Exception as e:
@@ -204,7 +208,7 @@ def dsa_page_no(year):
     data = urllib.parse.urlencode({'sEcho': 1, 'iColumns': 4, 'iDisplayStart': 0, 'iDisplayLength': 1000, 'iSortCol_0': 3,
                                    'sSortDir_0': 'desc', 'q_ver': 'arbitr', 'date': '~', 'sSearch': '', 'court': ''}).encode()
     req = urllib.request.Request(DSA_HOST + '/opendata_data.php', data=data, headers={
-        'User-Agent': 'Mozilla/5.0 edrsr.py', 'X-Requested-With': 'XMLHttpRequest',
+        'User-Agent': UA, 'X-Requested-With': 'XMLHttpRequest',
         'Referer': DSA_HOST + '/dsa/inshe/oddata/', 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'})
     rows = json.loads(urllib.request.urlopen(req, timeout=120, context=ssl_ctx()).read())['aaData']
     hits = [int(m.group(1)) for r in rows if re.match(rf'Єдиний державний реєстр судових рішень за {year} рік\.', r[0])
@@ -239,7 +243,7 @@ def dsa_resource(year):
     url = files.get(f'edrsr_data_{year}.zip') or next((v for k, v in files.items() if k.endswith('.zip')), None)
     if not url:
         raise LookupError(f'У паспорті набору ДСА {n} немає архіву за {year} рік')
-    h = urllib.request.urlopen(urllib.request.Request(url, method='HEAD', headers={'User-Agent': 'Mozilla/5.0 edrsr.py'}),
+    h = urllib.request.urlopen(urllib.request.Request(url, method='HEAD', headers={'User-Agent': UA}),
                                timeout=60, context=ssl_ctx()).headers
     size = int(h.get('Content-Length') or 0)
     if size < 100000:
